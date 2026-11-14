@@ -1,3 +1,5 @@
+import { getSupabaseConfigurationError, requireSupabase } from './supabase.js';
+
 const authStatus = document.getElementById('auth-status');
 const loginForm = document.getElementById('login-form');
 const registerForm = document.getElementById('register-form');
@@ -19,6 +21,19 @@ document.querySelectorAll('[data-auth-view]').forEach(button => {
     });
 });
 
+function getReturnUrl() {
+    const params = new URLSearchParams(window.location.search);
+    const joinCode = params.get('join');
+    const gameId = params.get('game');
+    if (joinCode && /^[A-Z0-9]{6}$/i.test(joinCode)) {
+        return `index.html?join=${encodeURIComponent(joinCode.toUpperCase())}`;
+    }
+    if (gameId && /^[0-9a-f-]{36}$/i.test(gameId)) {
+        return `index.html?game=${encodeURIComponent(gameId)}`;
+    }
+    return 'index.html';
+}
+
 async function submitAuthForm(event, action) {
     event.preventDefault();
     const form = event.currentTarget;
@@ -26,17 +41,37 @@ async function submitAuthForm(event, action) {
     submitButton.disabled = true;
     setAuthStatus('');
 
-    const data = Object.fromEntries(new FormData(form).entries());
-
     try {
-        const result = await API.auth(action, data);
-        if (!result.success) {
-            throw new Error(result.error || 'Não foi possível autenticar.');
+        const supabase = requireSupabase();
+        const data = Object.fromEntries(new FormData(form).entries());
+
+        if (action === 'register') {
+            const { data: result, error } = await supabase.auth.signUp({
+                email: data.email,
+                password: data.password,
+                options: {
+                    data: { display_name: data.name.trim() },
+                    emailRedirectTo: new URL(getReturnUrl(), window.location.href).href,
+                },
+            });
+            if (error) throw error;
+
+            if (!result.session) {
+                setAuthStatus('Conta criada. Confirme seu e-mail e depois entre para jogar.');
+                form.reset();
+                return;
+            }
+        } else {
+            const { error } = await supabase.auth.signInWithPassword({
+                email: data.email,
+                password: data.password,
+            });
+            if (error) throw error;
         }
 
-        window.location.assign('index.php');
+        window.location.assign(getReturnUrl());
     } catch (error) {
-        setAuthStatus(error.message, 'error');
+        setAuthStatus(error.message || getSupabaseConfigurationError(), 'error');
     } finally {
         submitButton.disabled = false;
     }
@@ -45,13 +80,14 @@ async function submitAuthForm(event, action) {
 loginForm.addEventListener('submit', event => submitAuthForm(event, 'login'));
 registerForm.addEventListener('submit', event => submitAuthForm(event, 'register'));
 
-API.auth('me')
-    .then(result => {
-        if (!result.success) {
-            throw new Error(result.error || 'Não foi possível verificar a conta.');
-        }
-        if (result.user) {
-            window.location.assign('index.php');
-        }
-    })
-    .catch(error => setAuthStatus(error.message, 'error'));
+const configurationError = getSupabaseConfigurationError();
+if (configurationError) {
+    setAuthStatus(configurationError, 'error');
+} else {
+    requireSupabase().auth.getSession()
+        .then(({ data, error }) => {
+            if (error) throw error;
+            if (data.session) window.location.assign(getReturnUrl());
+        })
+        .catch(error => setAuthStatus(error.message, 'error'));
+}

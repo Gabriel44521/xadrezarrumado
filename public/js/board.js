@@ -7,7 +7,7 @@ const PIECE_SYMBOLS = {
     black: { K: '♚', Q: '♛', R: '♜', B: '♝', N: '♞', P: '♟' },
 };
 
-const Board = {
+export const Board = {
     element: document.getElementById('board'),
     onSquareClick: null,
     audioContext: null,

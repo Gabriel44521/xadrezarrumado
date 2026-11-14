@@ -1,32 +1,439 @@
-/**
- * ui.js — conecta o tabuleiro à API e atualiza o estado da interface.
- */
+import { Chess } from 'chess.js';
+import { Board } from './board.js';
+import { callGameApi } from './api.js';
+import { getSupabaseConfigurationError, requireSupabase } from './supabase.js';
 
 const statusEl = document.getElementById('status');
 const newGameBtn = document.getElementById('new-game-btn');
 const modeSelect = document.getElementById('mode-select');
 const difficultySelect = document.getElementById('difficulty-select');
-const claimDrawBtn = document.getElementById('claim-draw-btn');
 const promotionDialog = document.getElementById('promotion-dialog');
 const accountUserLabel = document.getElementById('account-user-label');
 const accountLink = document.getElementById('account-link');
 const logoutBtn = document.getElementById('logout-btn');
+const createRoomBtn = document.getElementById('create-room-btn');
+const joinRoomForm = document.getElementById('join-room-form');
+const roomCodeInput = document.getElementById('room-code-input');
+const invitePanel = document.getElementById('invite-panel');
+const onlineStatus = document.getElementById('online-status');
+const inviteLinkInput = document.getElementById('invite-link');
+const copyInviteBtn = document.getElementById('copy-invite-btn');
+const resignBtn = document.getElementById('resign-btn');
+
+const HUMAN_COLOR = 'white';
+const AI_THINKING_TIME = 700;
+let chess = new Chess();
+let currentMode = 'player-vs-ai';
+let onlineGame = null;
+let onlineColor = null;
+let onlineChannel = null;
+let signedInUser = null;
+let selectedSquare = null;
+let legalMoves = [];
+let isBusy = false;
+let aiTimer = null;
+
+function setStatus(message, state = '') {
+    statusEl.textContent = message;
+    statusEl.dataset.state = state;
+}
+
+function setOnlineStatus(message, state = '') {
+    onlineStatus.textContent = message;
+    onlineStatus.dataset.state = state;
+}
+
+function squareCoordinates(square) {
+    return [8 - Number(square[1]), square.charCodeAt(0) - 97];
+}
+
+function squareName(row, col) {
+    return `${String.fromCharCode(97 + col)}${8 - row}`;
+}
+
+function getBoardState() {
+    return chess.board().map(row => row.map(piece => piece
+        ? { type: piece.type.toUpperCase(), color: piece.color === 'w' ? 'white' : 'black' }
+        : null));
+}
+
+function getMoveAnimation(move) {
+    if (!move) return null;
+    const to = squareCoordinates(move.to);
+    return {
+        from: squareCoordinates(move.from),
+        to,
+        captureAt: move.captureAt
+            ? squareCoordinates(move.captureAt)
+            : move.flags?.includes('e')
+                ? [to[0] + (move.color === 'w' ? 1 : -1), to[1]]
+                : null,
+        promotion: move.promotion || null,
+        rookMove: move.rookMove
+            ? { from: squareCoordinates(move.rookMove.from), to: squareCoordinates(move.rookMove.to) }
+            : move.flags?.includes('k') || move.flags?.includes('q')
+            ? {
+                from: [move.color === 'w' ? 7 : 0, move.flags.includes('k') ? 7 : 0],
+                to: [move.color === 'w' ? 7 : 0, move.flags.includes('k') ? 5 : 3],
+            }
+            : null,
+    };
+}
+
+async function renderBoard(move = null) {
+    if (move?.captured) Board.playCaptureSound();
+    await Board.render(getBoardState(), selectedSquare, legalMoves, getMoveAnimation(move), Boolean(move?.captured));
+}
+
+function describeTurn() {
+    if (onlineGame?.status === 'waiting') {
+        setStatus(`Sala ${onlineGame.code} criada. Compartilhe o link e aguarde seu amigo.`);
+        setOnlineStatus('Aguardando seu amigo entrar na sala…', 'thinking');
+        return;
+    }
+
+    if (onlineGame?.status === 'finished' && !chess.isGameOver()) {
+        const winner = onlineGame.winnerColor;
+        const result = winner
+            ? `Partida encerrada. ${winner === 'white' ? 'Brancas' : 'Pretas'} venceram.`
+            : 'Partida encerrada em empate.';
+        setStatus(result, 'finished');
+        setOnlineStatus(result, 'finished');
+        return;
+    }
+
+    if (chess.isCheckmate()) {
+        const winner = chess.turn() === 'w' ? 'Pretas' : 'Brancas';
+        setStatus(`Xeque-mate! Vencedor: ${winner}.`, 'finished');
+        if (onlineGame) setOnlineStatus(`Partida encerrada: ${winner} venceram.`, 'finished');
+        return;
+    }
+
+    if (chess.isGameOver()) {
+        const message = chess.isStalemate()
+            ? 'Empate por afogamento.'
+            : chess.isThreefoldRepetition()
+                ? 'Empate por repetição.'
+                : chess.isInsufficientMaterial()
+                    ? 'Empate por material insuficiente.'
+                    : chess.isDrawByFiftyMoves()
+                        ? 'Empate pela regra dos 50 lances.'
+                        : 'Partida empatada.';
+        setStatus(message, 'finished');
+        if (onlineGame) setOnlineStatus(message, 'finished');
+        return;
+    }
+
+    const turn = chess.turn() === 'w' ? 'white' : 'black';
+    const label = turn === 'white' ? 'Brancas' : 'Pretas';
+    if (onlineGame) {
+        const ownTurn = turn === onlineColor;
+        const checkMessage = chess.isCheck() ? `${label} em xeque! ` : '';
+        const message = `${checkMessage}${ownTurn ? 'Sua vez' : 'Vez do seu amigo'} (${label}).`;
+        setStatus(message, ownTurn ? '' : 'thinking');
+        setOnlineStatus(`Você joga com ${onlineColor === 'white' ? 'as brancas' : 'as pretas'}. ${message}`);
+    } else {
+        setStatus(chess.isCheck() ? `${label} em xeque! Vez de ${label}.` : `Vez de: ${label}`);
+    }
+}
+
+function leaveOnlineRoom() {
+    if (onlineChannel && getSupabaseConfigurationError() === null) {
+        requireSupabase().removeChannel(onlineChannel);
+    }
+    onlineChannel = null;
+    onlineGame = null;
+    onlineColor = null;
+    invitePanel.hidden = true;
+    resignBtn.hidden = true;
+    window.history.replaceState({}, '', window.location.pathname);
+}
 
 function updateAccount(user) {
-    accountUserLabel.textContent = user ? `Olá, ${user.name}!` : '';
+    signedInUser = user;
+    accountUserLabel.textContent = user
+        ? `Olá, ${user.user_metadata?.display_name || user.email || 'jogador'}!`
+        : 'Jogue localmente ou entre na sua conta para jogar online.';
     accountLink.hidden = Boolean(user);
     logoutBtn.hidden = !user;
 }
 
+function requireLogin() {
+    if (signedInUser) return true;
+    const returnUrl = window.location.search;
+    window.location.assign(`auth.html${returnUrl}`);
+    return false;
+}
+
+function syncInvitePanel(game) {
+    invitePanel.hidden = false;
+    inviteLinkInput.value = `${window.location.origin}${window.location.pathname}?join=${game.code}`;
+    resignBtn.hidden = game.status !== 'active';
+}
+
+async function syncOnlineGame(game) {
+    if (onlineGame?.id === game.id && game.version < onlineGame.version) return;
+    const changed = !onlineGame || onlineGame.version !== game.version || onlineGame.status !== game.status;
+    onlineGame = game;
+    onlineColor = game.whitePlayer === signedInUser?.id ? 'white'
+        : game.blackPlayer === signedInUser?.id ? 'black' : null;
+    chess.load(game.fen);
+    selectedSquare = null;
+    legalMoves = [];
+    syncInvitePanel(game);
+    window.history.replaceState({}, '', `${window.location.pathname}?game=${game.id}`);
+    if (changed) await renderBoard(game.lastMove);
+    describeTurn();
+}
+
+async function subscribeToGame(gameId) {
+    if (onlineChannel) await requireSupabase().removeChannel(onlineChannel);
+    onlineChannel = requireSupabase()
+        .channel(`game-${gameId}`)
+        .on('postgres_changes', {
+            event: 'UPDATE',
+            schema: 'public',
+            table: 'games',
+            filter: `id=eq.${gameId}`,
+        }, async () => {
+            if (!onlineGame) return;
+            try {
+                const freshGame = await callGameApi('state', { id: gameId });
+                await syncOnlineGame(freshGame);
+            } catch (error) {
+                setOnlineStatus(error.message, 'error');
+            }
+        })
+        .subscribe(async (state, error) => {
+            if (state === 'CHANNEL_ERROR' || state === 'TIMED_OUT') {
+                setOnlineStatus(`Conexão em tempo real instável: ${error?.message || state}.`, 'error');
+            } else if (state === 'SUBSCRIBED' && !isBusy) {
+                try {
+                    await syncOnlineGame(await callGameApi('state', { id: gameId }));
+                } catch (syncError) {
+                    setOnlineStatus(syncError.message, 'error');
+                }
+            }
+        });
+}
+
+async function openOnlineGame(game) {
+    stopAiLoop();
+    currentMode = 'online';
+    modeSelect.disabled = true;
+    createRoomBtn.disabled = false;
+    roomCodeInput.value = '';
+    await syncOnlineGame(game);
+    await subscribeToGame(game.id);
+}
+
+function stopAiLoop() {
+    if (aiTimer !== null) {
+        clearTimeout(aiTimer);
+        aiTimer = null;
+    }
+}
+
+function choosePromotion() {
+    return new Promise(resolve => {
+        promotionDialog.addEventListener('close', () => {
+            resolve(promotionDialog.returnValue || 'q');
+        }, { once: true });
+        promotionDialog.showModal();
+    });
+}
+
+function listLegalMoves(row, col) {
+    return chess.moves({ square: squareName(row, col), verbose: true })
+        .map(move => squareCoordinates(move.to));
+}
+
+async function sendMove(from, to, promotion) {
+    if (onlineGame) {
+        const updatedGame = await callGameApi('move', {
+            id: onlineGame.id,
+            version: onlineGame.version,
+            from,
+            to,
+            promotion,
+        });
+        await syncOnlineGame(updatedGame);
+        return;
+    }
+
+    let move;
+    try {
+        move = chess.move({ from, to, promotion });
+    } catch (error) {
+        setStatus(error.message, 'error');
+        return;
+    }
+    await renderBoard(move);
+    describeTurn();
+
+    if (currentMode === 'ai-vs-ai' || (currentMode === 'player-vs-ai' && chess.turn() === 'b')) {
+        scheduleAiMove();
+    }
+}
+
+async function handleSquareClick(row, col) {
+    if (isBusy || chess.isGameOver()) return;
+    if (onlineGame && (onlineGame.status !== 'active' || onlineColor !== (chess.turn() === 'w' ? 'white' : 'black'))) {
+        return;
+    }
+    if (!onlineGame && currentMode === 'ai-vs-ai') return;
+    if (!onlineGame && currentMode === 'player-vs-ai' && chess.turn() !== 'w') return;
+
+    Board.prepareAudio();
+    const clickedSquare = squareName(row, col);
+    const clickedPiece = chess.get(clickedSquare);
+    const turnColor = chess.turn();
+
+    if (selectedSquare === null) {
+        if (!clickedPiece || clickedPiece.color !== turnColor) return;
+        selectedSquare = [row, col];
+        legalMoves = listLegalMoves(row, col);
+        await Board.render(getBoardState(), selectedSquare, legalMoves);
+        return;
+    }
+
+    const [fromRow, fromCol] = selectedSquare;
+    const from = squareName(fromRow, fromCol);
+    if (clickedSquare === from) {
+        selectedSquare = null;
+        legalMoves = [];
+        await Board.render(getBoardState());
+        return;
+    }
+    if (clickedPiece?.color === turnColor) {
+        selectedSquare = [row, col];
+        legalMoves = listLegalMoves(row, col);
+        await Board.render(getBoardState(), selectedSquare, legalMoves);
+        return;
+    }
+    if (!legalMoves.some(([moveRow, moveCol]) => moveRow === row && moveCol === col)) return;
+
+    selectedSquare = null;
+    legalMoves = [];
+    isBusy = true;
+    newGameBtn.disabled = true;
+    try {
+        const piece = chess.get(from);
+        const promotion = piece?.type === 'p' && (row === 0 || row === 7)
+            ? await choosePromotion()
+            : undefined;
+        await sendMove(from, clickedSquare, promotion);
+    } catch (error) {
+        setStatus(error.message, 'error');
+        if (onlineGame) {
+            try {
+                await syncOnlineGame(await callGameApi('state', { id: onlineGame.id }));
+            } catch (refreshError) {
+                setOnlineStatus(refreshError.message, 'error');
+            }
+        }
+    } finally {
+        isBusy = false;
+        newGameBtn.disabled = false;
+    }
+}
+
+function chooseAiMove() {
+    const moves = chess.moves({ verbose: true });
+    if (difficultySelect.value === 'greedy') {
+        const captures = moves.filter(move => move.captured);
+        if (captures.length) return captures[Math.floor(Math.random() * captures.length)];
+    }
+    return moves[Math.floor(Math.random() * moves.length)];
+}
+
+function scheduleAiMove() {
+    stopAiLoop();
+    if (chess.isGameOver()) return;
+    setStatus('IA pensando...', 'thinking');
+    aiTimer = setTimeout(async () => {
+        aiTimer = null;
+        const move = chooseAiMove();
+        if (move) {
+            chess.move(move);
+            await renderBoard(move);
+            describeTurn();
+            if (currentMode === 'ai-vs-ai') scheduleAiMove();
+        }
+    }, AI_THINKING_TIME);
+}
+
+async function requireSessionForOnline() {
+    if (!requireLogin()) return null;
+    return signedInUser;
+}
+
+createRoomBtn.addEventListener('click', async () => {
+    if (!await requireSessionForOnline()) return;
+    createRoomBtn.disabled = true;
+    setOnlineStatus('Criando sala…', 'thinking');
+    invitePanel.hidden = false;
+    try {
+        await openOnlineGame(await callGameApi('create'));
+    } catch (error) {
+        setOnlineStatus(error.message, 'error');
+        createRoomBtn.disabled = false;
+    }
+});
+
+joinRoomForm.addEventListener('submit', async event => {
+    event.preventDefault();
+    if (!await requireSessionForOnline()) return;
+    const code = roomCodeInput.value.trim().toUpperCase();
+    if (!/^[A-Z0-9]{6}$/.test(code)) {
+        setOnlineStatus('Digite o código de convite com 6 caracteres.', 'error');
+        invitePanel.hidden = false;
+        return;
+    }
+
+    setOnlineStatus('Entrando na sala…', 'thinking');
+    invitePanel.hidden = false;
+    try {
+        await openOnlineGame(await callGameApi('join', { code }));
+    } catch (error) {
+        setOnlineStatus(error.message, 'error');
+    }
+});
+
+copyInviteBtn.addEventListener('click', async () => {
+    try {
+        await navigator.clipboard.writeText(inviteLinkInput.value);
+        copyInviteBtn.textContent = 'Copiado!';
+        setTimeout(() => { copyInviteBtn.textContent = 'Copiar'; }, 1800);
+    } catch {
+        inviteLinkInput.select();
+        document.execCommand('copy');
+        setOnlineStatus('Link copiado.');
+    }
+});
+
+resignBtn.addEventListener('click', async () => {
+    if (!onlineGame || onlineGame.status !== 'active' || isBusy) return;
+    isBusy = true;
+    resignBtn.disabled = true;
+    try {
+        await syncOnlineGame(await callGameApi('resign', {
+            id: onlineGame.id,
+            version: onlineGame.version,
+        }));
+    } catch (error) {
+        setOnlineStatus(error.message, 'error');
+    } finally {
+        isBusy = false;
+        resignBtn.disabled = false;
+    }
+});
+
 logoutBtn.addEventListener('click', async () => {
     logoutBtn.disabled = true;
     try {
-        const result = await API.auth('logout');
-        if (!result.success) {
-            throw new Error(result.error || 'Não foi possível sair da conta.');
-        }
-        updateAccount(null);
-        accountUserLabel.textContent = 'Você saiu da conta.';
+        leaveOnlineRoom();
+        await requireSupabase().auth.signOut();
     } catch (error) {
         accountUserLabel.textContent = error.message;
     } finally {
@@ -34,283 +441,68 @@ logoutBtn.addEventListener('click', async () => {
     }
 });
 
-API.auth('me')
-    .then(result => {
-        if (!result.success) {
-            throw new Error(result.error || 'Não foi possível verificar a conta.');
-        }
-        updateAccount(result.user);
-    })
-    .catch(error => {
-        accountUserLabel.textContent = error.message;
-        accountLink.hidden = false;
-    });
-
-let currentMode = 'player-vs-ai';
-let selectedSquare = null;
-let legalMoves = [];
-let aiVsAiTimer = null;
-let isBusy = false;
-let gameVersion = 0;
-
-const HUMAN_COLOR = 'white';
-const AI_THINKING_TIME = 1000;
-
-function setStatus(text, state = '') {
-    statusEl.textContent = text;
-    statusEl.dataset.state = state;
-}
-
-function waitForAi() {
-    return new Promise(resolve => {
-        aiVsAiTimer = setTimeout(resolve, AI_THINKING_TIME);
-    });
-}
-
-function stopAiVsAiLoop() {
-    if (aiVsAiTimer !== null) {
-        clearTimeout(aiVsAiTimer);
-        aiVsAiTimer = null;
-    }
-}
-
-/**
- * Atualiza o tabuleiro e a mensagem da vez a partir da resposta da API.
- */
-async function updateFromResponse(data, move = null) {
-    window.lastDrawClaims = data.drawClaims || {
-        threefoldRepetition: false,
-        fiftyMoveRule: false,
-    };
-    if (data.captured) {
-        Board.playCaptureSound();
-    }
-    legalMoves = [];
-    await Board.render(data.board, selectedSquare, legalMoves, move, Boolean(data.captured));
-
-    claimDrawBtn.hidden = data.status !== null || !data.drawClaims
-        || (!data.drawClaims.threefoldRepetition && !data.drawClaims.fiftyMoveRule);
-
-    if (data.status === 'checkmate') {
-        setStatus(`Xeque-mate! Vencedor: ${data.winner === 'white' ? 'Brancas' : 'Pretas'}`, 'finished');
-        stopAiVsAiLoop();
-    } else if (data.status === 'stalemate') {
-        setStatus('Empate por afogamento (stalemate).', 'finished');
-        stopAiVsAiLoop();
-    } else if (data.status) {
-        const drawMessages = {
-            'draw-insufficient-material': 'Empate por material insuficiente.',
-            'draw-fivefold-repetition': 'Empate automático por repetição quíntupla.',
-            'draw-seventy-five-move': 'Empate automático pela regra dos 75 lances.',
-            'draw-repetition': 'Empate reivindicado por repetição tripla.',
-            'draw-fifty-move': 'Empate reivindicado pela regra dos 50 lances.',
-        };
-        setStatus(drawMessages[data.status] || 'A partida terminou empatada.', 'finished');
-        stopAiVsAiLoop();
-    } else {
-        const turnLabel = data.turn === 'white' ? 'Brancas' : 'Pretas';
-        setStatus(data.inCheck ? `${turnLabel} em xeque! Vez de ${turnLabel}.` : `Vez de: ${turnLabel}`);
-    }
-}
-
-function choosePromotion() {
-    return new Promise(resolve => {
-        promotionDialog.addEventListener('close', () => {
-            resolve(promotionDialog.returnValue || 'Q');
-        }, { once: true });
-        promotionDialog.showModal();
-    });
-}
-
-/**
- * No modo IA vs. IA, cada jogada começa após um segundo de espera.
- */
-async function playAiVsAiTurn(version) {
-    if (currentMode !== 'ai-vs-ai' || version !== gameVersion) {
-        return;
-    }
-
-    setStatus('IA pensando...', 'thinking');
-    await waitForAi();
-    aiVsAiTimer = null;
-
-    if (currentMode !== 'ai-vs-ai' || version !== gameVersion) {
-        return;
-    }
-
-    try {
-        const data = await API.aiMove();
-        if (!data.success) {
-            throw new Error(data.error || 'Não foi possível obter a jogada da IA.');
-        }
-
-        await updateFromResponse(data, data.move);
-        if (data.status === null && version === gameVersion) {
-            playAiVsAiTurn(version);
-        }
-    } catch (error) {
-        if (version === gameVersion) {
-            setStatus(`Erro ao jogar: ${error.message}`, 'error');
-        }
-    }
-}
-
-Board.onSquareClick = async (row, col) => {
-    if (currentMode !== 'player-vs-ai' || isBusy) {
-        return;
-    }
-
-    Board.prepareAudio();
-
-    if (selectedSquare === null) {
-        const piece = window.lastBoardState?.[row]?.[col];
-        if (!piece || piece.color !== HUMAN_COLOR) {
-            return;
-        }
-
-        selectedSquare = [row, col];
-        isBusy = true;
-        newGameBtn.disabled = true;
-        try {
-            const data = await API.legalMoves(row, col);
-            if (!data.success) {
-                throw new Error(data.error || 'Não foi possível carregar as jogadas legais.');
-            }
-            legalMoves = data.moves;
-            await Board.render(window.lastBoardState, selectedSquare, legalMoves);
-        } catch (error) {
-            selectedSquare = null;
-            legalMoves = [];
-            setStatus(`Erro ao selecionar a peça: ${error.message}`, 'error');
-        } finally {
-            isBusy = false;
-            newGameBtn.disabled = false;
-        }
-        return;
-    }
-
-    const [fromRow, fromCol] = selectedSquare;
-    if (row === fromRow && col === fromCol) {
-        selectedSquare = null;
-        legalMoves = [];
-        await Board.render(window.lastBoardState);
-        return;
-    }
-
-    const clickedPiece = window.lastBoardState?.[row]?.[col];
-    if (clickedPiece?.color === HUMAN_COLOR) {
-        selectedSquare = null;
-        legalMoves = [];
-        await Board.render(window.lastBoardState);
-        Board.onSquareClick(row, col);
-        return;
-    }
-
-    if (!legalMoves.some(([moveRow, moveCol]) => moveRow === row && moveCol === col)) {
-        return;
-    }
-
-    selectedSquare = null;
-    legalMoves = [];
-    isBusy = true;
-    newGameBtn.disabled = true;
-
-    try {
-        const pawn = window.lastBoardState[fromRow][fromCol];
-        const promotes = pawn?.type === 'P' && (row === 0 || row === 7);
-        const promotion = promotes ? await choosePromotion() : 'Q';
-        const data = await API.move(fromRow, fromCol, row, col, promotion);
-        if (data.board) {
-            window.lastBoardState = data.board;
-        }
-
-        if (!data.success) {
-            setStatus(`Jogada inválida: ${data.error}`, 'error');
-            await Board.render(window.lastBoardState);
-            return;
-        }
-
-        await updateFromResponse(data, data.move);
-
-        if (data.status === null && data.turn !== HUMAN_COLOR) {
-            setStatus('IA pensando...', 'thinking');
-            await new Promise(resolve => setTimeout(resolve, AI_THINKING_TIME));
-
-            const aiData = await API.aiMove();
-            if (!aiData.success) {
-                throw new Error(aiData.error || 'Não foi possível obter a jogada da IA.');
-            }
-
-            window.lastBoardState = aiData.board;
-            await updateFromResponse(aiData, aiData.move);
-        }
-    } catch (error) {
-        setStatus(`Erro ao jogar: ${error.message}`, 'error');
-    } finally {
-        isBusy = false;
-        newGameBtn.disabled = false;
-    }
-};
-
 newGameBtn.addEventListener('click', async () => {
-    Board.prepareAudio();
-    stopAiVsAiLoop();
-    gameVersion++;
-    selectedSquare = null;
-    isBusy = true;
-    newGameBtn.disabled = true;
+    stopAiLoop();
+    leaveOnlineRoom();
     currentMode = modeSelect.value;
-
-    try {
-        const data = await API.newGame(currentMode, difficultySelect.value);
-        if (!data.success) {
-            throw new Error(data.error || 'Não foi possível iniciar a partida.');
-        }
-
-        window.lastBoardState = data.board;
-        legalMoves = [];
-        window.lastDrawClaims = {
-            threefoldRepetition: false,
-            fiftyMoveRule: false,
-        };
-        claimDrawBtn.hidden = true;
-        await Board.render(data.board);
-        setStatus(`Partida iniciada. Vez de: Brancas${currentMode === 'ai-vs-ai' ? ' — IA vs. IA' : ''}`);
-
-        if (currentMode === 'ai-vs-ai') {
-            playAiVsAiTurn(gameVersion);
-        }
-    } catch (error) {
-        setStatus(`Erro ao iniciar a partida: ${error.message}`, 'error');
-    } finally {
-        isBusy = false;
-        newGameBtn.disabled = false;
-    }
+    modeSelect.disabled = false;
+    chess = new Chess();
+    selectedSquare = null;
+    legalMoves = [];
+    await renderBoard();
+    describeTurn();
+    if (currentMode === 'ai-vs-ai') scheduleAiMove();
 });
 
-claimDrawBtn.addEventListener('click', async () => {
-    if (isBusy) {
+Board.onSquareClick = handleSquareClick;
+
+async function initialize() {
+    const configurationError = getSupabaseConfigurationError();
+    if (configurationError) {
+        updateAccount(null);
+        accountUserLabel.textContent = configurationError;
+        createRoomBtn.disabled = true;
+        joinRoomForm.querySelector('button').disabled = true;
+    } else {
+        const supabase = requireSupabase();
+        const { data, error } = await supabase.auth.getSession();
+        if (error) throw error;
+        updateAccount(data.session?.user || null);
+        supabase.auth.onAuthStateChange((_event, session) => updateAccount(session?.user || null));
+    }
+
+    await renderBoard();
+    const params = new URLSearchParams(window.location.search);
+    const roomId = params.get('game');
+    const inviteCode = params.get('join')?.toUpperCase();
+
+    if (!roomId && !inviteCode) return;
+    if (!signedInUser) {
+        if (inviteCode) roomCodeInput.value = inviteCode;
+        setOnlineStatus('Entre na sua conta para abrir o convite ou continuar a partida.');
+        invitePanel.hidden = false;
+        if (roomId) {
+            const loginUrl = new URL('auth.html', window.location.href);
+            loginUrl.searchParams.set('game', roomId);
+            accountLink.href = `${loginUrl.pathname}${loginUrl.search}`;
+        } else if (inviteCode && /^[A-Z0-9]{6}$/.test(inviteCode)) {
+            accountLink.href = `auth.html?join=${encodeURIComponent(inviteCode)}`;
+        }
         return;
     }
 
-    isBusy = true;
-    claimDrawBtn.disabled = true;
-    try {
-        const reason = window.lastDrawClaims?.threefoldRepetition ? 'repetition' : 'fifty-move';
-        const data = await API.claimDraw(reason);
-        if (!data.success) {
-            throw new Error(data.error || 'Não foi possível reivindicar o empate.');
-        }
-        claimDrawBtn.hidden = true;
-        const message = data.status === 'draw-repetition'
-            ? 'Empate reivindicado por repetição tripla.'
-            : 'Empate reivindicado pela regra dos 50 lances.';
-        setStatus(message, 'finished');
-        stopAiVsAiLoop();
-    } catch (error) {
-        setStatus(`Erro ao reivindicar empate: ${error.message}`, 'error');
-    } finally {
-        isBusy = false;
-        claimDrawBtn.disabled = false;
+    if (roomId) {
+        await openOnlineGame(await callGameApi('state', { id: roomId }));
+    } else if (inviteCode && /^[A-Z0-9]{6}$/.test(inviteCode)) {
+        roomCodeInput.value = inviteCode;
+        await openOnlineGame(await callGameApi('join', { code: inviteCode }));
+    }
+}
+
+initialize().catch(error => {
+    setOnlineStatus(error.message, 'error');
+    if (new URLSearchParams(window.location.search).has('game')
+        || new URLSearchParams(window.location.search).has('join')) {
+        invitePanel.hidden = false;
     }
 });
