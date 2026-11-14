@@ -9,8 +9,16 @@ const API = {
         return API._post('api/new-game.php', { mode, difficulty });
     },
 
-    async move(fromRow, fromCol, toRow, toCol) {
-        return API._post('api/move.php', { fromRow, fromCol, toRow, toCol });
+    async move(fromRow, fromCol, toRow, toCol, promotion = 'Q') {
+        return API._post('api/move.php', { fromRow, fromCol, toRow, toCol, promotion });
+    },
+
+    async legalMoves(row, col) {
+        return API._post('api/legal-moves.php', { row, col });
+    },
+
+    async claimDraw(reason) {
+        return API._post('api/claim-draw.php', { reason });
     },
 
     async aiMove() {
