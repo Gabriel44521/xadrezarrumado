@@ -10,6 +10,12 @@
     <div class="game-container">
         <h1>Xadrez em PHP</h1>
 
+        <section class="account-bar" aria-label="Conta do usuário">
+            <span id="account-user-label"></span>
+            <a id="account-link" href="auth.php">Entrar ou criar conta</a>
+            <button id="logout-btn" type="button" hidden>Sair</button>
+        </section>
+
         <div class="controls">
             <label>
                 Modo:

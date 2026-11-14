@@ -8,6 +8,43 @@ const modeSelect = document.getElementById('mode-select');
 const difficultySelect = document.getElementById('difficulty-select');
 const claimDrawBtn = document.getElementById('claim-draw-btn');
 const promotionDialog = document.getElementById('promotion-dialog');
+const accountUserLabel = document.getElementById('account-user-label');
+const accountLink = document.getElementById('account-link');
+const logoutBtn = document.getElementById('logout-btn');
+
+function updateAccount(user) {
+    accountUserLabel.textContent = user ? `Olá, ${user.name}!` : '';
+    accountLink.hidden = Boolean(user);
+    logoutBtn.hidden = !user;
+}
+
+logoutBtn.addEventListener('click', async () => {
+    logoutBtn.disabled = true;
+    try {
+        const result = await API.auth('logout');
+        if (!result.success) {
+            throw new Error(result.error || 'Não foi possível sair da conta.');
+        }
+        updateAccount(null);
+        accountUserLabel.textContent = 'Você saiu da conta.';
+    } catch (error) {
+        accountUserLabel.textContent = error.message;
+    } finally {
+        logoutBtn.disabled = false;
+    }
+});
+
+API.auth('me')
+    .then(result => {
+        if (!result.success) {
+            throw new Error(result.error || 'Não foi possível verificar a conta.');
+        }
+        updateAccount(result.user);
+    })
+    .catch(error => {
+        accountUserLabel.textContent = error.message;
+        accountLink.hidden = false;
+    });
 
 let currentMode = 'player-vs-ai';
 let selectedSquare = null;

@@ -5,6 +5,10 @@
  */
 
 const API = {
+    auth(action, data = {}) {
+        return API._post('api/auth.php', { action, ...data });
+    },
+
     async newGame(mode, difficulty) {
         return API._post('api/new-game.php', { mode, difficulty });
     },
